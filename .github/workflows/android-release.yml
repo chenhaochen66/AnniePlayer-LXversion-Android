@@ -1,0 +1,232 @@
+name: android-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  draft-release:
+    name: 签名构建并生成 Draft Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: release
+    env:
+      ANNIE_KEYSTORE_B64: ${{ secrets.ANNIE_KEYSTORE_B64 }}
+      ANNIE_STORE_PASSWORD: ${{ secrets.ANNIE_STORE_PASSWORD }}
+      ANNIE_KEY_ALIAS: ${{ secrets.ANNIE_KEY_ALIAS }}
+      ANNIE_KEY_PASSWORD: ${{ secrets.ANNIE_KEY_PASSWORD }}
+      WRAPPER_KEYSTORE_B64: ${{ secrets.WRAPPER_KEYSTORE_B64 }}
+      WRAPPER_STORE_PASSWORD: ${{ secrets.WRAPPER_STORE_PASSWORD }}
+      WRAPPER_KEY_ALIAS: ${{ secrets.WRAPPER_KEY_ALIAS }}
+      WRAPPER_KEY_PASSWORD: ${{ secrets.WRAPPER_KEY_PASSWORD }}
+    steps:
+      - name: 取源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 安装 SDK 组件
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006" "cmake;3.22.1"
+
+      - name: 预取 Gradle 分发（国内镜像不可达时回退官方源）
+        run: |
+          set -euo pipefail
+          for dir in android-native android-native/wrapper-lite-app; do
+            cd "$GITHUB_WORKSPACE/$dir"
+            if ! timeout 300 ./gradlew --version > /dev/null 2>&1; then
+              sed -i 's#mirrors.cloud.tencent.com/gradle/#services.gradle.org/distributions/#' gradle/wrapper/gradle-wrapper.properties
+              ./gradlew --version > /dev/null
+            fi
+          done
+
+      - name: 校验 tag、版本与 main
+        id: meta
+        env:
+          TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "HEAD 不在 origin/main 上：只能从已合入 main 的提交出包" >&2
+            exit 1
+          fi
+          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' android-native/app/build.gradle.kts | head -n 1)
+          VERSION_CODE=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' android-native/app/build.gradle.kts | head -n 1)
+          if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
+            echo "读不到 versionName / versionCode" >&2
+            exit 1
+          fi
+          if [ -n "${TAG_NAME}" ] && [ "${TAG_NAME}" != "v${VERSION_NAME}" ]; then
+            echo "tag ${TAG_NAME} 与 versionName ${VERSION_NAME} 不一致" >&2
+            exit 1
+          fi
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "版本：${VERSION_NAME}（versionCode ${VERSION_CODE}），tag：v${VERSION_NAME}"
+
+      - name: 检查发布凭据是否就绪
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in ANNIE_KEYSTORE_B64 ANNIE_STORE_PASSWORD ANNIE_KEY_ALIAS ANNIE_KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "release Environment 缺少 Secret：$name" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            exit 1
+          fi
+
+      - name: 写入主程序签名配置
+        run: |
+          set -euo pipefail
+          mkdir -p android-native/keystore
+          printf '%s' "$ANNIE_KEYSTORE_B64" | base64 -d > android-native/keystore/annie-release.jks
+          test -s android-native/keystore/annie-release.jks
+          {
+            echo "storeFile=keystore/annie-release.jks"
+            echo "storePassword=$ANNIE_STORE_PASSWORD"
+            echo "keyAlias=$ANNIE_KEY_ALIAS"
+            echo "keyPassword=$ANNIE_KEY_PASSWORD"
+          } > android-native/keystore.properties
+
+      - name: assembleRelease（主程序）
+        working-directory: android-native
+        run: ./gradlew :app:assembleRelease --console=plain --stacktrace
+
+      - name: 校验签名并整理产物
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          SRC=android-native/app/build/outputs/apk/release/app-release.apk
+          test -f "$SRC"
+          "$APKSIGNER" verify --print-certs "$SRC" | tee /tmp/annie-certs.txt
+          if grep -qi "CN=Android Debug" /tmp/annie-certs.txt; then
+            echo "产物由 debug 密钥签名，拒绝进入发布流程" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          OUT="dist/AnniePlayer-${{ steps.meta.outputs.version_name }}-arm64.apk"
+          cp "$SRC" "$OUT"
+          echo "APK $OUT"
+          echo "SHA256 $(sha256sum "$OUT" | cut -d' ' -f1)"
+
+      - name: 写入 WrapperLite 签名配置
+        if: env.WRAPPER_KEYSTORE_B64 != ''
+        run: |
+          set -euo pipefail
+          mkdir -p android-native/wrapper-lite-app/keystore
+          printf '%s' "$WRAPPER_KEYSTORE_B64" | base64 -d > android-native/wrapper-lite-app/keystore/wrapperlite-release.jks
+          test -s android-native/wrapper-lite-app/keystore/wrapperlite-release.jks
+          {
+            echo "storeFile=keystore/wrapperlite-release.jks"
+            echo "storePassword=$WRAPPER_STORE_PASSWORD"
+            echo "keyAlias=$WRAPPER_KEY_ALIAS"
+            echo "keyPassword=$WRAPPER_KEY_PASSWORD"
+          } > android-native/wrapper-lite-app/keystore.properties
+
+      - name: assembleRelease（WrapperLite）
+        if: env.WRAPPER_KEYSTORE_B64 != ''
+        working-directory: android-native/wrapper-lite-app
+        run: ./gradlew :app:assembleRelease --console=plain --stacktrace
+
+      - name: 校验 WrapperLite 签名并整理产物
+        if: env.WRAPPER_KEYSTORE_B64 != ''
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          SRC=android-native/wrapper-lite-app/app/build/outputs/apk/release/app-release.apk
+          test -f "$SRC"
+          "$APKSIGNER" verify --print-certs "$SRC" | tee /tmp/wrapper-certs.txt
+          if grep -qi "CN=Android Debug" /tmp/wrapper-certs.txt; then
+            echo "WrapperLite 产物由 debug 密钥签名，拒绝进入发布流程" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          OUT="dist/WrapperLite-${{ steps.meta.outputs.version_name }}-arm64.apk"
+          cp "$SRC" "$OUT"
+          echo "APK $OUT"
+          echo "SHA256 $(sha256sum "$OUT" | cut -d' ' -f1)"
+
+      - name: 生成更新日志
+        run: |
+          set -euo pipefail
+          PREV_TAG=$(git describe --tags --abbrev=0 'HEAD^' 2>/dev/null || true)
+          {
+            echo "versionCode: ${{ steps.meta.outputs.version_code }}"
+            echo ""
+            echo "## 更新内容"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              git log --no-merges --pretty='- %s' "$PREV_TAG..HEAD"
+            else
+              git log --no-merges --pretty='- %s' -30
+            fi
+            echo ""
+            echo "## 安装说明"
+            echo ""
+            echo "- 仅 arm64-v8a，Android 7.0（API 24）及以上"
+            echo "- 主程序包名 \`com.annieplayer.annie_music.kt\`，WrapperLite 包名 \`com.annieplayer.wrapperlite\`，两者互不覆盖"
+            echo "- 首次安装需要允许「安装未知应用」"
+            echo ""
+            echo "## 校验"
+            echo ""
+            echo "SHA256 见 \`SHA256SUMS.txt\`；两个包都由发布密钥签名，可用 \`apksigner verify --print-certs\` 复核。"
+          } > dist/RELEASE-NOTES.md
+          cat dist/RELEASE-NOTES.md
+
+      - name: 生成 SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          {
+            echo "## android-release v${{ steps.meta.outputs.version_name }}（Draft）"
+            echo ""
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 生成 Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: false
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: ${{ steps.meta.outputs.release_tag }}
+          body_path: dist/RELEASE-NOTES.md
+          files: |
+            dist/*.apk
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+
+      - name: 清理签名材料
+        if: always()
+        run: |
+          rm -f android-native/keystore.properties android-native/wrapper-lite-app/keystore.properties
+          rm -rf android-native/keystore android-native/wrapper-lite-app/keystore
