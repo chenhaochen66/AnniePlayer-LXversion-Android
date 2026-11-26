@@ -59,14 +59,19 @@ jobs:
         run: |
           set -euo pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
+          SIZE=$(stat -c%s "$APK")
+          HASH=$(sha256sum "$APK" | cut -d' ' -f1)
+          echo "APK=$APK"
+          echo "APK_BYTES=$SIZE"
+          echo "APK_SHA256=$HASH"
           {
             echo "## AnniePlayer"
             echo ""
             echo "产物：\`app-debug.apk\`（runner 自动生成的 debug keystore 签名，**不含发布密钥**，不可对外发布）"
             echo ""
             echo '```'
-            ls -l "$APK" | awk '{print $5" bytes  "$9}'
-            sha256sum "$APK"
+            echo "$SIZE bytes  $APK"
+            echo "$HASH  $APK"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           python3 - "$GITHUB_STEP_SUMMARY" <<'PY'
@@ -80,6 +85,7 @@ jobs:
               tests += int(root.get("tests") or 0)
               failures += int(root.get("failures") or 0) + int(root.get("errors") or 0)
               skipped += int(root.get("skipped") or 0)
+          print(f"TESTS={tests} FAILURES={failures} SKIPPED={skipped}")
           with open(sys.argv[1], "a", encoding="utf-8") as out:
               out.write(f"\n单测：{tests} 例，失败 {failures}，跳过 {skipped}\n")
           PY
@@ -132,14 +138,19 @@ jobs:
         run: |
           set -euo pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
+          SIZE=$(stat -c%s "$APK")
+          HASH=$(sha256sum "$APK" | cut -d' ' -f1)
+          echo "APK=$APK"
+          echo "APK_BYTES=$SIZE"
+          echo "APK_SHA256=$HASH"
           {
             echo "## WrapperLite"
             echo ""
             echo "产物：\`app-debug.apk\`（runner 自动生成的 debug keystore 签名，**不含发布密钥**，不可对外发布）"
             echo ""
             echo '```'
-            ls -l "$APK" | awk '{print $5" bytes  "$9}'
-            sha256sum "$APK"
+            echo "$SIZE bytes  $APK"
+            echo "$HASH  $APK"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -179,6 +190,7 @@ jobs:
       - name: 主程序 assembleRelease 必须失败
         working-directory: android-native
         run: |
+          set -euo pipefail
           if ./gradlew :app:assembleRelease --console=plain 2>&1 | tee /tmp/release.log; then
             echo "缺少 keystore.properties 时 assembleRelease 仍然成功，签名守卫失效" >&2
             exit 1
@@ -193,6 +205,7 @@ jobs:
       - name: wrapper-lite assembleRelease 必须失败
         working-directory: android-native/wrapper-lite-app
         run: |
+          set -euo pipefail
           if ./gradlew :app:assembleRelease --console=plain 2>&1 | tee /tmp/wrapper-release.log; then
             echo "缺少 keystore.properties 时 assembleRelease 仍然成功，签名守卫失效" >&2
             exit 1
